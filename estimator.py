@@ -89,6 +89,54 @@ def compose_similarity_transform(scale, rotation, offset):
     M = transformation_compose_2d(M, np.concatenate([rotation, np.zeros([2, 1])], 1).astype(np.float32))
     M = transformation_compose_2d(M, transformation_offset_2d(offset[0], offset[1]))
     return M
+def rotate_camera_pose(pose, angle):
+    """
+    Rotate the camera pose around its optical axis (Z-axis).
+    
+    Args:
+        pose: Input camera pose (3x4 or 4x4).
+        angle: Rotation angle in radians.
+    
+    Returns:
+        New pose (same shape as input).
+    """
+    assert pose.shape in [(3, 4), (4, 4)], "Pose must be 3x4 or 4x4"
+    
+    # Extract rotation part (R) and translation part (t)
+    R = pose[:3, :3]
+    t = pose[:3, 3] if pose.shape == (3, 4) else pose[:3, 3:4]
+    
+    # Create in-plane rotation matrix (around Z-axis)
+    # R_rot = np.array([
+    #     [np.cos(angle), -np.sin(angle), 0],
+    #     [np.sin(angle),  np.cos(angle), 0],
+    #     [0,             0,              1]
+    # ])
+    # Create rotation matrix around Y-axis
+    R_rot = np.array([
+        [np.cos(angle),  0, np.sin(angle)],
+        [0,              1, 0            ],
+        [-np.sin(angle), 0, np.cos(angle)]
+    ])
+    # Rotation matrix around X-axis (pitch)
+    # R_rot = np.array([
+    #     [1, 0,              0              ],
+    #     [0, np.cos(angle), -np.sin(angle)],
+    #     [0, np.sin(angle),  np.cos(angle)]
+    # ])
+    
+    # Apply rotation: R_new = R * R_rot (注意顺序！)
+    R_new = R @ R_rot
+    
+    # Combine into new pose
+    if pose.shape == (3, 4):
+        new_pose = np.hstack([R_new, t.reshape(3, 1)])
+    else:
+        new_pose = np.eye(4)
+        new_pose[:3, :3] = R_new
+        new_pose[:3, 3] = t.flatten()
+    
+    return new_pose
 
 
 class Gen6DEstimator:
@@ -141,6 +189,7 @@ class Gen6DEstimator:
 
     def build(self, database: BaseDatabase, split_type: str):
         object_center = get_object_center(database)
+        print('object_center:',object_center)
         object_vert = get_object_vert(database)
         ref_ids_all, _ = get_database_split(database, split_type)
 
@@ -151,8 +200,31 @@ class Gen6DEstimator:
         # in-plane rotation for viewpoint selection
         # save ref_imgs
         os.makedirs('debug/vis_val/',exist_ok=True)
-        imsave('debug/vis_val/ref_img.png',concat_images_list(*ref_imgs))
+        imsave('debug/vis_val/ref_img.png',concat_images_list(*ref_imgs[:4]))
+        # 调用 GS 渲染的图像进行ref_img
         rfn, h, w, _ = ref_imgs.shape
+        if hasattr(database,'gaussian_model'):
+            ref_imgs = []
+            ref_masks = []
+            for pose,K in zip(ref_poses,ref_Ks):
+                render,depth = database.render(pose, K, width = w, height=h)
+                ref_mask = (depth>0).astype(np.float32)
+                ref_masks.append(ref_mask)
+                ref_imgs.append(render)
+            imsave('debug/vis_val/ref_img_render.png',concat_images_list(*ref_imgs[:4]))
+            # ref_imgs_rots = []
+            # angles = [-np.pi/2, -np.pi/4, 0, np.pi/4, np.pi/2]
+            # for angle in angles:
+            #     ref_imgs_rot = []
+            #     for pose in ref_poses:
+            #         rot_pose = rotate_camera_pose(pose, angle)  
+            #         ref_imgs_rot.append(database.render(rot_pose, K, width = w, height=h)[0])
+            #     ref_imgs_rots.append(np.stack(ref_imgs_rot, 0))
+            # ref_imgs = np.stack(ref_imgs, 0)
+            # ref_imgs_rots = np.stack(ref_imgs_rots, 0) # an,rfn,h,w,3
+            # imsave('debug/vis_val/ref_img_rotate_render0.png',concat_images_list(*ref_imgs_rots[0][:4]))
+            # imsave('debug/vis_val/ref_img_rotate_render4.png',concat_images_list(*ref_imgs_rots[-1][:4]))
+
         ref_imgs_rots = []
         angles = [-np.pi/2, -np.pi/4, 0, np.pi/4, np.pi/2]
         for angle in angles:
@@ -166,8 +238,11 @@ class Gen6DEstimator:
                 H_new = H_ @ ref_Hs[rfi]
                 ref_imgs_rot.append(cv2.warpPerspective(database.get_image(ref_ids[rfi]), H_new, (w,h), flags=cv2.INTER_LINEAR))
             ref_imgs_rots.append(np.stack(ref_imgs_rot, 0))
+        ref_imgs = np.stack(ref_imgs, 0)
+        ref_masks = np.stack(ref_masks, 0)
         ref_imgs_rots = np.stack(ref_imgs_rots, 0) # an,rfn,h,w,3
-        imsave('debug/vis_val/ref_img_rotate.png',concat_images_list(*ref_imgs_rots))
+        imsave('debug/vis_val/ref_img_rotate.png',concat_images_list(*ref_imgs_rots[0][:4]))
+        # raise ValueError
         self.detector.load_ref_imgs(ref_imgs[:self.cfg['det_ref_view_num']])
         self.selector.load_ref_imgs(ref_imgs_rots, ref_poses, object_center, object_vert)
         self.ref_info={'imgs': ref_imgs, 'ref_imgs': ref_imgs_rots, 'masks': ref_masks, 'Ks': ref_Ks, 'poses': ref_poses, 'center': object_center}

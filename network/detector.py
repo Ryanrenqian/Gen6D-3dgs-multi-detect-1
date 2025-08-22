@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 from typing import List
+from skimage.io import imsave
 from network.pretrain_models import VGGBNPretrain
 from utils.base_utils import color_map_forward, transformation_crop, to_cpu_numpy,color_map_backward
 from utils.bbox_utils import parse_bbox_from_scale_offset
@@ -145,7 +146,6 @@ class Detector(BaseDetector):
     def __init__(self, cfg):
         self.cfg={**self.default_cfg,**cfg}
         super().__init__()
-        self.transpose = False
         self.backbone = VGGBNPretrain()
         if self.cfg["train_feats"]:
             # disable BN training only
@@ -234,6 +234,7 @@ class Detector(BaseDetector):
 
     def detect_impl(self, que_imgs):
         qn, _, hq, wq = que_imgs.shape
+        print(que_imgs.shape)
         hs, ws = hq // 8, wq // 8
         scores = []
         for scale in self.cfg['detection_scales']:
@@ -346,8 +347,6 @@ class MultDetector(Detector):
         for bboxes in img_result.boxes:
             for bbox in bboxes.xyxyn:
                 x1, y1, x2, y2 = bbox.tolist()
-                if self.transpose:
-                    y1,y2  = 1 - y2,1 - y1
                 obj_bboxes.append([x1, y1, x2, y2])
         return obj_bboxes
 
@@ -364,13 +363,12 @@ class MultDetector(Detector):
         """
         extracted_objects = []
         h, w = que_img.shape[:2]  # 获取图像高度和宽度
-        print(h,w)
         for bbox in bboxes:
             print(bbox)
             # 将相对坐标转换为绝对坐标
             x1, y1, x2, y2 = bbox
             x1, x2 = int(x1 * w), int(x2 * w)
-            y1, y2 = int(y1 * h),  int(y2 * h)
+            y1, y2 = h - int(y1 * h), h - int(y2 * h)
             
             # 确保坐标在图像范围内
             x1, x2 = sorted([max(0, x1), min(w, x2)])
@@ -385,6 +383,8 @@ class MultDetector(Detector):
                 obj = que_img * mask[:, :, np.newaxis]
             else:  # 灰度图像
                 obj = que_img * mask
+            # if transpose:
+            # obj = np.array(Image.fromarray(obj).transpose(Image.FLIP_TOP_BOTTOM))
             extracted_objects.append(obj)
         return extracted_objects
     
@@ -393,23 +393,22 @@ class MultDetector(Detector):
         @param que_imgs: [h,w,3]
         @return:
         """
-        que_imgs = que_img[None]
+        _, h, w = que_img.shape
         img = Image.fromarray(que_img)
         # 上下翻转
-        if self.transpose:
-            img = img.transpose(Image.FLIP_TOP_BOTTOM)
-        # img.save('./que_img_o.jpg')
-        qn, _, h, w = que_imgs.shape
+        img = img.transpose(Image.FLIP_TOP_BOTTOM)
+        img.save('./que_img_yolo.jpg')
+        img = np.array(img)
+        
         # 使用yolo先检测多个物体的位置，然后将bbox外的像素设置为空，给原模型检测
         normal_bboxes = self.yoloe_detect(img)
-        object_imgs = self.extract_object(color_map_forward(que_img),normal_bboxes)
-        # # 保存que_imgs用于debug
-        # for i,img in enumerate(object_imgs):
-        #     plt.imshow(img)
-        #     plt.savefig(f'./que_imgs_{i}.jpg')
-        #     plt.close()
+        object_imgs = self.extract_object(que_img,normal_bboxes)
+        # 保存que_imgs用于debug
+        for i,img in enumerate(object_imgs):
+            imsave(f'./que_imgs_{i}.png',img)
         detection_results = []
         for new_img in object_imgs:
+            new_img =  color_map_forward(new_img)
             new_img = torch.from_numpy(new_img[None]).permute(0,3,1,2).cuda()
             outputs = self.detect_impl(new_img)
             positions, scales = self.parse_detection(

@@ -368,21 +368,20 @@ class GSDatabase(BaseDatabase):
         self.scale_ratio = self.compute_normalized_ratio(self.gaussian_model.get_xyz)
         print('scale_ratio',self.scale_ratio)
         self.gaussian_model.rescale(self.scale_ratio)
-        gaussian_points = self.gaussian_model.get_xyz
-
-        # 计算物体中心（基于原始高斯点）
-        min_pt = torch.min(gaussian_points, dim=0)[0]  # torch.min 返回 (values, indices)，取 values
-        max_pt = torch.max(gaussian_points, dim=0)[0]  # torch.max 返回 (values, indices)，取 values
-        self.center = ((max_pt + min_pt) / 2).detach().cpu().numpy()  # 转换为numpy用于后续计算
-        print('Center',self.center)
+        # 移动，以center 为原点
+        center = self.object_center
+        # print('p1',self.object_center)
+        # self.gaussian_model.translation(center)
+        # print('p2',self.object_center)
         # 修改位姿以匹配变换参数
         for k, pose in self.poses.items():
             R = pose[:3, :3]
-            t = pose[:3, 3:]
+            t = pose[:3, 3:] 
             R = R @ self.rotation.T
-            t = self.scale_ratio.detach().cpu().numpy() * t
+            # t = self.scale_ratio.detach().cpu().numpy() * t - center[None].detach().cpu().T.numpy()
+            t = self.scale_ratio.detach().cpu().numpy() * t 
             self.poses[k] = np.concatenate([R,t], 1).astype(np.float32)
-            
+    
     
     def _initialize_3dgs_model(self):
         """初始化3D Gaussian Splatting模型"""
@@ -470,7 +469,7 @@ class GSDatabase(BaseDatabase):
             T=t,
             depth_params= None,
             invdepthmap = None,
-            resolution = self.image_size ,
+            resolution = image_size ,
             FoVx=2 * np.arctan(image_size[0] / (2 * K[0, 0])),
             FoVy=2 * np.arctan(image_size[1] / (2 * K[1, 1])),
             image=Image.new('RGB', image_size, (0, 0, 0)),
@@ -481,7 +480,7 @@ class GSDatabase(BaseDatabase):
         
         # 设置背景颜色
         if background_color is None:
-            background_color = torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32)
+            background_color = torch.tensor([0.1, 0.5, 0.3], dtype=torch.float32)
         else:
             background_color = torch.tensor(background_color, dtype=torch.float32)
         
@@ -507,6 +506,15 @@ class GSDatabase(BaseDatabase):
     @property
     def object_point_cloud(self):
         return self.gaussian_model.get_xyz.detach().cpu().numpy()
+    
+    @property
+    def object_center(self):
+        gaussian_points = self.gaussian_model.get_xyz
+        # 计算物体中心（基于原始高斯点）
+        min_pt = torch.min(gaussian_points, dim=0)[0]  # torch.min 返回 (values, indices)，取 values
+        max_pt = torch.max(gaussian_points, dim=0)[0]  # torch.max 返回 (values, indices)，取 values
+        center = ((max_pt + min_pt) / 2).detach() # 转换为numpy用于后续计算
+        return center
 
     def get_image(self, img_id,origin=False):
         """获取指定ID的图像"""
@@ -662,7 +670,7 @@ def get_object_center(database):
     elif isinstance(database, CustomDatabase):
         return database.center
     elif isinstance(database, GSDatabase):
-        return database.center
+        return database.object_center.detach().cpu().numpy()
     elif isinstance(database, NormalizedDatabase):
         return np.zeros(3,dtype=np.float32)
     else:

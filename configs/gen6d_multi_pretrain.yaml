@@ -8,4 +8,4 @@ refiner:  configs/refiner/refiner_pretrain.yaml
 ref_resolution: 128   # reference image resolution
 ref_view_num: 64      # view number used in selection
 det_ref_view_num: 32  # view number used in detection
-refine_iter: 3        # refinement iteration number
+refine_iter: 1        # refinement iteration number

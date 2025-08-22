@@ -42,16 +42,16 @@ def main(args):
     (output_dir / 'images_raw').mkdir(exist_ok=True, parents=True)
     (output_dir / 'images_out').mkdir(exist_ok=True, parents=True)
     (output_dir / 'images_inter').mkdir(exist_ok=True, parents=True)
-    (output_dir / 'images_out_smooth').mkdir(exist_ok=True, parents=True)
 
-    img_paths = video2image(args.video, output_dir/'images_raw', 30, args.resolution, args.transpose)
-    # img_paths = sorted([str(x) for x in (output_dir/'images_raw').glob('*.jpg')])
+
+    # img_paths = video2image(args.video, output_dir/'images_raw', 30, args.resolution, args.transpose)
+    img_paths = sorted([str(x) for x in (output_dir/'images_raw').glob('*.jpg')])[31:32]
     # pose_init = None
-    hist_pts = []
     for que_id,img_path in tqdm(enumerate(img_paths)):
-    # for que_id in tqdm(range(1161,1165)):
-        # img = imread(str(output_dir/'images_raw'/f'frame{que_id}.jpg'))
         img = imread(img_path)
+    # for que_id in tqdm(range(40,41)):
+        # img = imread(str(output_dir/'images_raw'/f'frame{que_id}.jpg'))
+        
         # generate a pseudo K
         h, w, _ = img.shape
         f = np.sqrt(h**2+w**2)
