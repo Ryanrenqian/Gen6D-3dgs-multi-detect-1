@@ -349,6 +349,27 @@ class MultDetector(Detector):
                 x1, y1, x2, y2 = bbox.tolist()
                 obj_bboxes.append([x1, y1, x2, y2])
         return obj_bboxes
+    
+    def load_impl(self, ref_imgs):
+        self.visual_prompt = dict(
+            bboxes=[
+                np.array(
+                    [
+                        [0.0, 120.0, 0.0, 120.0],  # Box enclosing person
+                    ]
+                ),
+            ],
+            cls=[
+                np.array(
+                    [
+                        0,  # ID to be assigned for target
+                    ]
+                ),
+                np.array([0]),
+            ],
+        )
+
+
 
     def extract_object(self, que_img, bboxes):
         """
@@ -363,6 +384,7 @@ class MultDetector(Detector):
         """
         extracted_objects = []
         h, w = que_img.shape[:2]  # 获取图像高度和宽度
+        img_bboxes = []
         for bbox in bboxes:
             print(bbox)
             # 将相对坐标转换为绝对坐标
@@ -375,6 +397,7 @@ class MultDetector(Detector):
             y1, y2 = sorted([max(0, y1), min(h, y2)])
             # 创建全零掩码
             mask = np.zeros((h, w), dtype=np.uint8)
+            img_bboxes.append([x1,y1,x2,y2])
             # 在bbox区域内设置为1
             mask[y1:y2, x1:x2] = 1
             # 打印mask区域大小
@@ -386,7 +409,7 @@ class MultDetector(Detector):
             # if transpose:
             # obj = np.array(Image.fromarray(obj).transpose(Image.FLIP_TOP_BOTTOM))
             extracted_objects.append(obj)
-        return extracted_objects
+        return extracted_objects,img_bboxes
     
     def detect_que_imgs(self, que_img):
         """
@@ -399,22 +422,27 @@ class MultDetector(Detector):
         img = img.transpose(Image.FLIP_TOP_BOTTOM)
         img.save('./que_img_yolo.jpg')
         img = np.array(img)
-        
         # 使用yolo先检测多个物体的位置，然后将bbox外的像素设置为空，给原模型检测
         normal_bboxes = self.yoloe_detect(img)
-        object_imgs = self.extract_object(que_img,normal_bboxes)
+        object_imgs,img_bboxes = self.extract_object(que_img,normal_bboxes)
         # 保存que_imgs用于debug
         for i,img in enumerate(object_imgs):
             imsave(f'./que_imgs_{i}.png',img)
+        # 打印normal_bboxes的 center 点和 bbox 大小和 img 尺寸关系
+
         detection_results = []
-        for new_img in object_imgs:
+        for new_img,img_bbox in zip(object_imgs,img_bboxes):
+            bbox_w,bbox_h = abs(img_bbox[2]-img_bbox[0])/2,abs(img_bbox[3]-img_bbox[1])
+            scales = [max(bbox_w,bbox_h)/128]
             new_img =  color_map_forward(new_img)
             new_img = torch.from_numpy(new_img[None]).permute(0,3,1,2).cuda()
-            outputs = self.detect_impl(new_img)
-            positions, scales = self.parse_detection(
-                outputs['scores'].detach(), outputs['select_pr_scale'].detach(),
-                outputs['select_pr_offset'].detach(), self.pool_ratio)
+            positions = np.array([[(img_bbox[2]+img_bbox[0])/2,(img_bbox[3]+img_bbox[1])/2]])
+            # outputs = self.detect_impl(new_img)
+            # positions, scales = self.parse_detection(
+            #     outputs['scores'].detach(), outputs['select_pr_scale'].detach(),
+            #     outputs['select_pr_offset'].detach(), self.pool_ratio)
             detection_result = {'positions': positions, 'scales': scales}
             detection_result = to_cpu_numpy(detection_result)
             detection_results.append(detection_result)
+        torch.save([normal_bboxes,detection_results],'tmp.torch')
         return detection_results
