@@ -2,6 +2,7 @@ import abc
 import glob
 from pathlib import Path
 import sys
+from typing import List, Tuple,Union
 sys.path.append('gaussian-splatting')
 import cv2
 import numpy as np
@@ -10,11 +11,11 @@ import torch
 import plyfile
 from PIL import Image
 from skimage.io import imread, imsave
-
 from utils.base_utils import read_pickle, save_pickle, pose_compose, load_point_cloud, pose_inverse, resize_img, \
     mask_depth_to_pts, transform_points_pose
+from functools import lru_cache
 from utils.read_write_model import read_model
-
+# from utils.database_utils import generate_reference_views
 SUN_IMAGE_ROOT = 'data/SUN2012pascalformat/JPEGImages'
 SUN_IMAGE_ROOT_128 = 'data/SUN2012pascalformat/JPEGImages_128'
 SUN_IMAGE_ROOT_256 = 'data/SUN2012pascalformat/JPEGImages_256'
@@ -173,16 +174,13 @@ def parse_colmap_project(cameras, images, img_fns):
     # 获取第一个图像来判断是否为Windows COLMAP格式
     v = images[list(images.keys())[0]]
     is_windows_colmap = v.name.startswith('frame')
-    
     # 建立图像名称到数据库ID的映射
     if is_windows_colmap:
         img_id2db_id = {v.name: k for k, v in images.items()}
     else:
-        img_id2db_id = {v.name[:-4]: k for k, v in images.items()}
-    
+        img_id2db_id = { str(k) : int(k)  for k, v in images.items()}
     poses, Ks = {}, {}
-    img_ids = [str(k) for k in range(len(img_fns))]
-    print(img_ids)
+    img_ids = [str(k+1) for k in range(len(img_fns))]
     # 遍历所有图像ID，提取位姿和内参
     for img_id in img_ids:
         if is_windows_colmap:
@@ -203,7 +201,6 @@ def parse_colmap_project(cameras, images, img_fns):
         # 提取相机内参
         cam_id = images[db_id].camera_id
         camera = cameras[cam_id]
-        
         # 根据相机模型提取内参
         if camera.model == 'PINHOLE':
             fx, fy, cx, cy = camera.params
@@ -217,8 +214,6 @@ def parse_colmap_project(cameras, images, img_fns):
             K = np.array([[f, 0, cx], [0, f, cy], [0, 0, 1]], np.float32)
         else:
             raise NotImplementedError
-
-        
         Ks[img_id] = K
     return poses, Ks, img_ids
 
@@ -324,63 +319,189 @@ class CustomDatabase(BaseDatabase):
         """获取所有图像ID"""
         return self.img_ids
 
+def lookat(eye: np.ndarray, target: np.ndarray, up: np.ndarray = np.array([0, 1, 0])) -> np.ndarray:
+    """
+    OpenCV风格的lookat函数
+    返回4x4的视图矩阵 [R | t]
+    """
+    # 计算相机坐标系轴
+    z_axis = (target - eye)
+    z_axis = z_axis / np.linalg.norm(z_axis)
+    
+    x_axis = np.cross(up, z_axis)
+    x_axis = x_axis / np.linalg.norm(x_axis)
+    
+    y_axis = np.cross(z_axis, x_axis)
+    
+    # 构建旋转矩阵
+    R = np.vstack([x_axis, y_axis, z_axis])
+    
+    # 构建平移向量 t = -R @ eye
+    t = -R @ eye
+    
+    # 构建4x4矩阵
+    view_matrix = np.eye(4, dtype=np.float32)
+    view_matrix[:3, :3] = R
+    view_matrix[:3, 3] = t
+    
+    return view_matrix
+
+def calculate_k_from_fov(fov_degrees: float, image_size: int) -> np.ndarray:
+    """
+    根据FoV计算内参矩阵K
+    """
+    fov_rad = np.radians(fov_degrees)
+    focal_length = (image_size / 2) / np.tan(fov_rad / 2)
+    center = image_size / 2
+    
+    K = np.array([
+        [focal_length, 0, center],
+        [0, focal_length, center],
+        [0, 0, 1]
+    ], dtype=np.float32)
+    
+    return K
+
+def generate_camera_positions_on_sphere(
+    num_views: int, 
+    radius_range: Union[float, Tuple[float, float]] = (1.0, 5.0),
+    elevation_clamp: Tuple[float, float] = (0.0, 90.0)
+) -> List[np.ndarray]:
+    """
+    使用斐波那契球面采样算法生成均匀分布的球面点（数值稳定版）
+    
+    参数:
+        num_views: 采样点数量（至少为2）
+        radius_range: 球体半径范围（单个值或[min, max]）
+        elevation_clamp: 仰角限制（度），避免极点附近采样
+        
+    返回:
+        均匀分布的球面点坐标列表（无NaN）
+    """
+    # 输入检查
+    assert num_views >= 2, "num_views must be >= 2"
+    if isinstance(radius_range, (list, tuple)):
+        assert radius_range[0] > 0 and radius_range[1] > 0, "radius_range must be positive"
+        radius_min, radius_max = radius_range[0], radius_range[1]
+    else:
+        assert radius_range > 0, "radius must be positive"
+        radius_min = radius_max = radius_range
+    
+    # 计算仰角范围（转换为y的上下界）
+    elev_min, elev_max = np.radians(elevation_clamp[0]), np.radians(elevation_clamp[1])
+    y_min, y_max = np.sin(elev_min), np.sin(elev_max)
+    
+    # 黄金角度
+    phi = np.pi * (3.0 - np.sqrt(5.0))
+    points = []
+    
+    for i in range(num_views):
+        # y ∈ [y_min, y_max]，避免数值误差
+        y = y_min + (y_max - y_min) * (i / (num_views - 1))
+        y = np.clip(y, -1.0 + 1e-6, 1.0 - 1e-6)  # 严格限制在 (-1, 1)
+        
+        # 计算x/z平面上的半径
+        radius_at_y = np.sqrt(1.0 - y * y)
+        # 黄金角度递增
+        theta = phi * i
+        # 随机半径
+        for radius in np.linspace(radius_min, radius_max, 4):
+        # radius = np.random.uniform(radius_min, radius_max)
+            # 笛卡尔坐标
+            x = np.cos(theta) * radius_at_y * radius
+            y_val = y * radius
+            z = np.sin(theta) * radius_at_y * radius
+            
+            points.append(np.array([x, y_val, z], dtype=np.float32))
+    
+    return points
+
+
+def generate_reference_views(image_size=128, ref_num=128, fov_degrees=60, 
+                           radius_range=(0.9,5.0)) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+    """
+    使用lookat方法生成参考视角
+    
+    参数:
+        database: 数据库对象（未使用）
+        image_size: 图像尺寸
+        ref_num: 视角数量
+        fov_degrees: 视场角度
+        sphere_radius: 球面半径
+        elevation_range: 仰角范围（度）
+    
+    返回:
+        RTs: 4x4外参矩阵列表
+        Ks: 3x3内参矩阵列表
+    """
+    # 计算内参矩阵
+    K = calculate_k_from_fov(fov_degrees, image_size)
+    
+    # 在球面上生成相机位置
+    camera_positions = generate_camera_positions_on_sphere(
+        radius_range = radius_range,   num_views=ref_num)
+    
+    RTs = []
+    Ks = []
+    target = np.array([0, 0, 0], dtype=np.float32)  # 物体中心
+    up = np.array([0, 1, 0], dtype=np.float32)      # 上方向
+    
+    print(f"生成 {ref_num} 个视角, FoV: {fov_degrees}°")
+    print(f"内参矩阵 K:\n{K}")
+    
+    for i, eye in enumerate(camera_positions):
+        # 使用lookat计算视图矩阵
+        view_matrix = lookat(eye, target, up)
+        RTs.append(view_matrix[:3])
+        Ks.append(K.copy())
+    return RTs, Ks
+
+    
 class GSDatabase(BaseDatabase):
     def __init__(self, database_name):
         super().__init__(database_name)
         # 设置数据根目录
-        self.root = Path(os.path.join('data',database_name))
-        self.img_dir = self.root / 'colmap' / 'images'
-        # 获取图像文件名列表
-        if (self.root/'img_fns.pkl').exists():
-            self.img_fns = read_pickle(str(self.root/'img_fns.pkl'))
-        else:
-            self.img_fns = [Path(fn).name for fn in glob.glob(str(self.img_dir)+'/*.jpg')]
-            save_pickle(self.img_fns, str(self.root/'img_fns.pkl'))
-        
-        # 解析COLMAP项目（如果存在）
-        self.colmap_root = self.root / 'colmap' 
-        if (self.colmap_root / 'sparse' / '0').exists():
-            cameras, images, points3d = read_model(str(self.colmap_root / 'sparse' / '0'))
-            self.poses, self.Ks, self.img_ids = parse_colmap_project(cameras, images, self.img_fns)
-        else:
-            raise ValueError('没有加载位姿信息')
+        # self.root = Path(os.path.join('data',database_name))
+        # self.gaussian_model_path = self.root / 'ref' / '3dgs' / 'point_cloud' / 'iteration_30000' / 'chair.ply'
+        self.gaussian_model_path = database_name
         # 获取默认图像
-        self.image_size = Image.open(str(self.img_dir/self.img_fns[0])).size
+        # self.image_size = Image.open(str(self.img_dir/self.img_fns[0])).size
+        self.image_size = (640,640)
         # image_width, image_height = image_size
         # 初始化3D Gaussian Splatting相关参数
         self.gaussian_model = None
         self.renderer = None
     
-        # 读取元信息进行缩放和旋转
-        directions = np.loadtxt(str(self.root/'meta_info.txt'))
-        x = directions[0]  # 前向方向
-        z = directions[1]  # 垂直方向
+
         
         # 初始化3D Gaussian Splatting模型（不进行变换）
         self._initialize_3dgs_model()
         
         # 计算旋转矩阵,并变换
-        self.rotation = GenMOPMetaInfoWrapper.compute_rotation(z, x)
-        self.gaussian_model.rotate_by_matrix(self.rotation)
-
+        # # 读取元信息进行旋转
+        # directions = np.loadtxt(str(self.root/ 'ref' /'meta_info.txt'))
+        # x = directions[0]  # 前向方向
+        # z = directions[1]  # 垂直方向
+        # self.rotation = GenMOPMetaInfoWrapper.compute_rotation(z, x)
+        # self.gaussian_model.rotate_by_matrix(self.rotation)
+        
         # 从3DGS模型获取点云用于缩放计算
-        # self.scale_ratio = 1
         self.scale_ratio = self.compute_normalized_ratio(self.gaussian_model.get_xyz)
-        print('scale_ratio',self.scale_ratio)
+        self.gaussian_model.translation( - self.object_center)
         self.gaussian_model.rescale(self.scale_ratio)
-        # 移动，以center 为原点
-        center = self.object_center
-        # print('p1',self.object_center)
-        # self.gaussian_model.translation(center)
-        # print('p2',self.object_center)
+
         # 修改位姿以匹配变换参数
-        for k, pose in self.poses.items():
-            R = pose[:3, :3]
-            t = pose[:3, 3:] 
-            R = R @ self.rotation.T
-            # t = self.scale_ratio.detach().cpu().numpy() * t - center[None].detach().cpu().T.numpy()
-            t = self.scale_ratio.detach().cpu().numpy() * t 
-            self.poses[k] = np.concatenate([R,t], 1).astype(np.float32)
+        RTs, Ks = generate_reference_views(image_size=self.image_size[0], ref_num=384, fov_degrees=60)
+        poses = {}
+        _Ks = {}
+        img_ids ={}
+        for _id,(RT,K) in enumerate(zip(RTs,Ks)):
+            poses[_id] = RT
+            _Ks[_id] = K
+            img_ids[_id] = _id
+        self.poses = poses
+        self.Ks = _Ks
+        self.img_ids = img_ids
     
     
     def _initialize_3dgs_model(self):
@@ -392,10 +513,10 @@ class GSDatabase(BaseDatabase):
         from utils.camera_utils import Camera
         
         # 加载预训练的3DGS模型或从点云初始化
-        gaussian_model_path = self.root / '3dgs' / 'point_cloud' / 'iteration_30000' / 'chair.ply'
-        print("Loading 3DGS model from:", gaussian_model_path)
+        
+        print("Loading 3DGS model from:", self.gaussian_model_path)
         # 从保存的高斯模型加载
-        self.gaussian_model = self._load_gaussian_model(str(gaussian_model_path))
+        self.gaussian_model = self._load_gaussian_model(str(self.gaussian_model_path))
         # 初始化 pipeline 参数
         class SimplePipelineParams:
             def __init__(self):
@@ -417,7 +538,7 @@ class GSDatabase(BaseDatabase):
         import sys
         sys.path.append('gaussian-splatting')
         from scene.gaussian_model import GaussianModel
-        model = GaussianModel(sh_degree=3)
+        model = GaussianModel(sh_degree=0)
         model.load_ply(model_path)
         return model
 
@@ -427,7 +548,7 @@ class GSDatabase(BaseDatabase):
         centers = self.gaussian_model.get_xyz.detach().cpu().numpy()
         return centers
     
-    
+    @torch.no_grad()
     def render(self, pose, K,  width=None,height=None,background_color=None):
         """使用3D Gaussian Splatting进行新视角合成渲染
         
@@ -477,7 +598,6 @@ class GSDatabase(BaseDatabase):
             uid=0,
             data_device="cuda" if torch.cuda.is_available() else "cpu"
         )
-        
         # 设置背景颜色
         if background_color is None:
             background_color = torch.tensor([0.1, 0.5, 0.3], dtype=torch.float32)
@@ -488,21 +608,21 @@ class GSDatabase(BaseDatabase):
             background_color = background_color.cuda()
         
         # 执行渲染
-        with torch.no_grad():
-            render_pkg = self.renderer(camera, self.gaussian_model,self.pipeline, background_color)
-            rendered_image = render_pkg["render"]
-            
-            # 转换为numpy格式 [H, W, 3]
-            rendered_image = rendered_image.permute(1, 2, 0).cpu().numpy()
-            rendered_image = np.clip(rendered_image, 0, 1)
-            
-            # 可选：返回深度图
-            rendered_depth = None
-            if "depth" in render_pkg:
-                rendered_depth = render_pkg["depth"].cpu().numpy()
+        render_pkg = self.renderer(camera, self.gaussian_model,self.pipeline, background_color)
+        rendered_image = render_pkg["render"]
+        
+        # 转换为numpy格式 [H, W, 3]
+        rendered_image = rendered_image.permute(1, 2, 0).detach().cpu().numpy()
+        rendered_image = np.clip(rendered_image, 0, 1)
+        
+        # 可选：返回深度图
+        rendered_depth = None
+        if "depth" in render_pkg:
+            rendered_depth = render_pkg["depth"].detach().cpu().numpy()
         # conver to np.uint8
-        rendered_image = (rendered_image * 255).astype(np.uint8)
-        return rendered_image, rendered_depth
+        render = (rendered_image * 255).astype(np.uint8)
+        # transpose， remove when not use tranpose
+        return render, rendered_depth
     @property
     def object_point_cloud(self):
         return self.gaussian_model.get_xyz.detach().cpu().numpy()
@@ -515,11 +635,13 @@ class GSDatabase(BaseDatabase):
         max_pt = torch.max(gaussian_points, dim=0)[0]  # torch.max 返回 (values, indices)，取 values
         center = ((max_pt + min_pt) / 2).detach() # 转换为numpy用于后续计算
         return center
-
-    def get_image(self, img_id,origin=False):
+    
+    @lru_cache(maxsize=None)
+    def get_image(self, img_id):
         """获取指定ID的图像"""
-        if origin:
-            return imread(str(self.img_dir/self.img_fns[int(img_id)]))
+        # if origin:
+        #     return imread(str(self.img_dir/self.img_fns[int(img_id)]))
+
         K = self.get_K(img_id)
         pose = self.get_pose(img_id)
         return self.render(pose, K)[0]
@@ -531,6 +653,7 @@ class GSDatabase(BaseDatabase):
     def get_pose(self, img_id):
         """获取相机位姿"""
         return self.poses[img_id].copy()
+
 
     def get_img_ids(self):
         """获取所有图像ID"""
@@ -591,11 +714,39 @@ def parse_database_name(database_name:str)->BaseDatabase:
         'shapenet': ShapeNetRenderDatabase,
         'gso': GoogleScannedObjectDatabase,
     }
+    
+    # 原始的精确匹配逻辑
     database_type = database_name.split('/')[0]
     if database_type in name2database:
         return name2database[database_type](database_name)
-    else:
-        raise NotImplementedError
+    
+    # 如果精确匹配失败，尝试模糊匹配
+    database_name_lower = database_name.lower()
+    
+    # 按优先级尝试匹配
+    for db_key, db_class in name2database.items():
+        # 检查数据库名称是否包含关键字
+        if db_key in database_name_lower:
+            return db_class(database_name)
+    
+    # 特殊匹配规则
+    if 'linemod' in database_name_lower or 'lm' in database_name_lower:
+        return LINEMODDatabase(database_name)
+    elif 'genmop' in database_name_lower or 'mop' in database_name_lower:
+        return GenMOPDatabase(database_name)
+    elif 'co3d' in database_name_lower:
+        return Co3DResizeDatabase(database_name)
+    elif 'shapenet' in database_name_lower or 'shape_net' in database_name_lower:
+        return ShapeNetRenderDatabase(database_name)
+    elif 'google' in database_name_lower or 'gso' in database_name_lower or 'scanned' in database_name_lower:
+        return GoogleScannedObjectDatabase(database_name)
+    elif 'gaussian' in database_name_lower or 'gs' in database_name_lower:
+        return GSDatabase(database_name)
+    elif 'custom' in database_name_lower:
+        return CustomDatabase(database_name)
+    
+    # 如果所有匹配都失败，抛出异常
+    raise NotImplementedError(f"无法识别数据库类型: {database_name}。支持的类型包括: {list(name2database.keys())}")
 
 def get_database_split(database, split_name):
     if split_name.startswith('linemod'): # linemod_test or linemod_val

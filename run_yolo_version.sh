@@ -1,0 +1,2 @@
+python predict.py --video_path data/gs/chair/test/images --output data/gs/chair/test/ --database data/gs/chair/ref/3dgs/point_cloud/iteration_30000/chair.ply --cfg configs/gen6d_multi_pretrain.yaml
+# python predict.py --video_path data/gs/chair/test/images/ --output data/gs/chair/test/ --database gs/chair --cfg configs/gen6d_pretrain.yaml

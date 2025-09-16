@@ -88,6 +88,7 @@ def normalize_reference_views(database, ref_ids, size, margin,
     ref_imgs_new, ref_Ks_new, ref_poses_new, ref_Hs, ref_masks_new, ref_imgs_rots = [], [], [], [], [], []
     for k in range(len(ref_ids)):
         ref_img = database.get_image(ref_ids[k])
+
         if add_rots:
             ref_img_rot = np.stack([look_at_crop(ref_img, ref_Ks[k], ref_poses[k], ref_cens[k], ref_vert_angle[k]+rot, ref_scales[k], size, size)[0] for rot in rots_list],0)
             ref_imgs_rots.append(ref_img_rot)
@@ -118,7 +119,6 @@ def select_reference_img_ids_fps(database, ref_ids_all, ref_num, random_fps=Fals
         idxs = sample_fps_points(cam_pts, ref_num, False, index_model=True)
     else:
         idxs = sample_fps_points(cam_pts, ref_num + 1, True, index_model=True)
-
     ref_ids = np.asarray(ref_ids_all)[idxs]  # rfn
     return ref_ids
 
@@ -142,3 +142,54 @@ def select_reference_img_ids_refinement(ref_database, object_center, ref_ids, se
 #     ref_ids = select_reference_img_ids_fps(database, ref_ids_all, ref_num)
 #     ref_imgs_new, ref_masks_new, ref_Ks_new, ref_poses_new, ref_Hs = construct_reference_views(database, ref_ids, size, margin)
 #     return ref_imgs_new, ref_masks_new, ref_Ks_new, ref_poses_new, ref_Hs, ref_ids
+def generate_reference_views(K, ref_num=32, size=128):
+    """
+    生成绕物体旋转360°的采样视角的R,T矩阵和Ks
+    
+    参数:
+        database: 数据库对象（虽然函数中未使用，但保留接口）
+        K: 相机内参矩阵
+        ref_num: 采样视角数量
+        size: 图像尺寸（虽然函数中未使用，但保留接口）
+    
+    返回:
+        Rs: 旋转矩阵列表
+        Ts: 平移向量列表  
+        Ks: 内参矩阵列表（所有视角使用相同内参）
+    """
+    # 固定相机距离，确保物体在视场内
+    d = 4.0  # 相机到物体中心的距离
+    
+    Rs = []
+    Ts = []
+    Ks = []
+    
+    # 生成ref_num个均匀分布的视角
+    for i in range(ref_num):
+        # 计算方位角（0到2π均匀分布）
+        phi = i * 2 * np.pi / ref_num
+        
+        sin_phi = np.sin(phi)
+        cos_phi = np.cos(phi)
+        
+        # 构建旋转矩阵 R
+        R = np.array([
+            [sin_phi, 0, -cos_phi],
+            [0, 1, 0],
+            [cos_phi, 0, sin_phi]
+        ], dtype=np.float32)
+        
+        # 构建平移向量 T = -R * C，其中C是相机位置
+        # 相机位置: [d*cos_phi, 0, d*sin_phi]
+        # 因此 T = -R @ [d*cos_phi, 0, d*sin_phi]^T
+        camera_pos = np.array([d * cos_phi, 0, d * sin_phi])
+        T = -R @ camera_pos
+        
+        # 也可以直接计算：由于R的特殊结构，T = [0, 0, -d]
+        # 但为了通用性，使用矩阵乘法计算
+        
+        Rs.append(R)
+        Ts.append(T)
+        Ks.append(K.copy())  # 所有视角使用相同内参
+    
+    return Rs, Ts, Ks

@@ -11,6 +11,7 @@ from utils.bbox_utils import parse_bbox_from_scale_offset
 import matplotlib.pyplot as plt
 import numpy as np
 from PIL import Image
+from ultralytics.models.yolo.yoloe import YOLOEVPSegPredictor
 class BaseDetector(nn.Module):
     def load_impl(self, ref_imgs):
         raise NotImplementedError
@@ -234,7 +235,7 @@ class Detector(BaseDetector):
 
     def detect_impl(self, que_imgs):
         qn, _, hq, wq = que_imgs.shape
-        print(que_imgs.shape)
+        # print(que_imgs.shape)
         hs, ws = hq // 8, wq // 8
         scores = []
         for scale in self.cfg['detection_scales']:
@@ -337,7 +338,6 @@ class MultDetector(Detector):
         返回单张图检测框的中心
         '''
         
-        # 使用翻转后的图像进行检测
         img_result = self.yolo_model.predict(img)[0]
         
         # imgs_centers = []
@@ -350,26 +350,36 @@ class MultDetector(Detector):
                 obj_bboxes.append([x1, y1, x2, y2])
         return obj_bboxes
     
-    def load_impl(self, ref_imgs):
-        self.visual_prompt = dict(
-            bboxes=[
-                np.array(
-                    [
-                        [0.0, 120.0, 0.0, 120.0],  # Box enclosing person
-                    ]
-                ),
-            ],
-            cls=[
-                np.array(
-                    [
-                        0,  # ID to be assigned for target
-                    ]
-                ),
-                np.array([0]),
-            ],
+    def set_classes(self, ref_img,visual_prompts = None):
+        if visual_prompts is None:
+            visual_prompts = dict(
+                bboxes=np.array([
+                            [0.0, 120.0, 0.0, 120.0],  # Box enclosing person
+                ]),
+                cls=
+                        np.array([
+                            0,  # ID to be assigned for target
+                        ])
+            )
+        num_cls = (
+                len(set(visual_prompts["cls"]))
         )
-
-
+        self.yolo_model.model.model[-1].nc = num_cls
+        self.yolo_model.model.names = [f"object{i}" for i in range(num_cls)]
+        # ref_img = ref_img.transpose(Image.FLIP_TOP_BOTTOM)
+        # save ref
+        # Image.fromarray(ref_img).save("ref.png")
+        imsave("ref.png", ref_img)
+        self.yolo_model.predict(
+            "ref.png",  # Target image for detection
+            refer_image="ref.png",  # Reference image used to get visual prompts
+            visual_prompts=visual_prompts,
+            predictor=YOLOEVPSegPredictor,
+        )
+        # print('use ref png')
+        # vpe = self.yolo_model.model.predictor.get_vpe(ref_img)
+        # self.yolo_model.model.set_classes(self.yolo_model.model.names, vpe)
+        
 
     def extract_object(self, que_img, bboxes):
         """
@@ -386,11 +396,10 @@ class MultDetector(Detector):
         h, w = que_img.shape[:2]  # 获取图像高度和宽度
         img_bboxes = []
         for bbox in bboxes:
-            print(bbox)
             # 将相对坐标转换为绝对坐标
             x1, y1, x2, y2 = bbox
             x1, x2 = int(x1 * w), int(x2 * w)
-            y1, y2 = h - int(y1 * h), h - int(y2 * h)
+            y1, y2 = int(y1 * h),  int(y2 * h)
             
             # 确保坐标在图像范围内
             x1, x2 = sorted([max(0, x1), min(w, x2)])
@@ -419,15 +428,15 @@ class MultDetector(Detector):
         _, h, w = que_img.shape
         img = Image.fromarray(que_img)
         # 上下翻转
-        img = img.transpose(Image.FLIP_TOP_BOTTOM)
-        img.save('./que_img_yolo.jpg')
+        # if self.cfg['transpose']:
+        #     img = img.transpose(Image.FLIP_TOP_BOTTOM)
         img = np.array(img)
         # 使用yolo先检测多个物体的位置，然后将bbox外的像素设置为空，给原模型检测
         normal_bboxes = self.yoloe_detect(img)
         object_imgs,img_bboxes = self.extract_object(que_img,normal_bboxes)
         # 保存que_imgs用于debug
-        for i,img in enumerate(object_imgs):
-            imsave(f'./que_imgs_{i}.png',img)
+        # for i,img in enumerate(object_imgs):
+        #     imsave(f'./que_imgs_{i}.png',img)
         # 打印normal_bboxes的 center 点和 bbox 大小和 img 尺寸关系
 
         detection_results = []
@@ -437,10 +446,6 @@ class MultDetector(Detector):
             new_img =  color_map_forward(new_img)
             new_img = torch.from_numpy(new_img[None]).permute(0,3,1,2).cuda()
             positions = np.array([[(img_bbox[2]+img_bbox[0])/2,(img_bbox[3]+img_bbox[1])/2]])
-            # outputs = self.detect_impl(new_img)
-            # positions, scales = self.parse_detection(
-            #     outputs['scores'].detach(), outputs['select_pr_scale'].detach(),
-            #     outputs['select_pr_offset'].detach(), self.pool_ratio)
             detection_result = {'positions': positions, 'scales': scales}
             detection_result = to_cpu_numpy(detection_result)
             detection_results.append(detection_result)

@@ -1,6 +1,8 @@
+from typing import Any
 import cv2
 import numpy as np
 import torch
+from PIL import Image
 import os
 from dataset.database import BaseDatabase, get_database_split, get_object_vert, get_object_center
 from skimage.io import imsave
@@ -154,9 +156,7 @@ class Gen6DEstimator:
     def __init__(self,cfg):
         self.cfg={**self.default_cfg,**cfg}
         self.ref_info={}
-
         self.detector = self._load_module(self.cfg['detector'])
-        self.detector.transpose = cfg['transpose']
         self.selector = self._load_module(self.cfg['selector'])
         if self.cfg['refiner'] is not None:
             self.refiner = self._load_module(self.cfg['refiner'])
@@ -192,39 +192,25 @@ class Gen6DEstimator:
         print('object_center:',object_center)
         object_vert = get_object_vert(database)
         ref_ids_all, _ = get_database_split(database, split_type)
-
         # use fps to select reference images for detection and selection
-        ref_ids = select_reference_img_ids_fps(database, ref_ids_all, self.cfg['ref_view_num'])
+        # ref_ids = select_reference_img_ids_fps(database, ref_ids_all, self.cfg['ref_view_num'])
+        ref_ids = list(ref_ids_all.values())
         ref_imgs, ref_masks, ref_Ks, ref_poses, ref_Hs = \
             normalize_reference_views(database, ref_ids, self.cfg['ref_resolution'], 0.05)
         # in-plane rotation for viewpoint selection
         # save ref_imgs
-        os.makedirs('debug/vis_val/',exist_ok=True)
-        imsave('debug/vis_val/ref_img.png',concat_images_list(*ref_imgs[:4]))
+        # os.makedirs('debug/vis_val/',exist_ok=True)
         # 调用 GS 渲染的图像进行ref_img
         rfn, h, w, _ = ref_imgs.shape
-        if hasattr(database,'gaussian_model'):
-            ref_imgs = []
-            ref_masks = []
-            for pose,K in zip(ref_poses,ref_Ks):
-                render,depth = database.render(pose, K, width = w, height=h)
-                ref_mask = (depth>0).astype(np.float32)
-                ref_masks.append(ref_mask)
-                ref_imgs.append(render)
-            imsave('debug/vis_val/ref_img_render.png',concat_images_list(*ref_imgs[:4]))
-            # ref_imgs_rots = []
-            # angles = [-np.pi/2, -np.pi/4, 0, np.pi/4, np.pi/2]
-            # for angle in angles:
-            #     ref_imgs_rot = []
-            #     for pose in ref_poses:
-            #         rot_pose = rotate_camera_pose(pose, angle)  
-            #         ref_imgs_rot.append(database.render(rot_pose, K, width = w, height=h)[0])
-            #     ref_imgs_rots.append(np.stack(ref_imgs_rot, 0))
-            # ref_imgs = np.stack(ref_imgs, 0)
-            # ref_imgs_rots = np.stack(ref_imgs_rots, 0) # an,rfn,h,w,3
-            # imsave('debug/vis_val/ref_img_rotate_render0.png',concat_images_list(*ref_imgs_rots[0][:4]))
-            # imsave('debug/vis_val/ref_img_rotate_render4.png',concat_images_list(*ref_imgs_rots[-1][:4]))
-
+        # if hasattr(database,'gaussian_model'):
+        #     ref_imgs = []
+        #     ref_masks = []
+        #     for pose,K in zip(ref_poses,ref_Ks):
+        #         render,depth = database.render(pose, K, width = w, height=h)
+        #         ref_mask = (depth>0).astype(np.float32)
+        #         ref_masks.append(ref_mask)
+        #         ref_imgs.append(render)
+        
         ref_imgs_rots = []
         angles = [-np.pi/2, -np.pi/4, 0, np.pi/4, np.pi/2]
         for angle in angles:
@@ -242,49 +228,47 @@ class Gen6DEstimator:
         ref_masks = np.stack(ref_masks, 0)
         ref_imgs_rots = np.stack(ref_imgs_rots, 0) # an,rfn,h,w,3
         imsave('debug/vis_val/ref_img_rotate.png',concat_images_list(*ref_imgs_rots[0][:4]))
-        # raise ValueError
+        imsave('debug/vis_val/ref_img.png',concat_images_list(ref_imgs))
         self.detector.load_ref_imgs(ref_imgs[:self.cfg['det_ref_view_num']])
+        # self.detector.set_classes(ref_imgs[0])
         self.selector.load_ref_imgs(ref_imgs_rots, ref_poses, object_center, object_vert)
         self.ref_info={'imgs': ref_imgs, 'ref_imgs': ref_imgs_rots, 'masks': ref_masks, 'Ks': ref_Ks, 'poses': ref_poses, 'center': object_center}
 
         if self.refiner is not None:
-            self.refiner.load_ref_imgs(database, ref_ids_all)
+            self.refiner.load_ref_imgs(database, ref_ids)
 
     def predict(self, que_img, que_K, pose_init=None):
         inter_results={}
+        # stage 1: detection
+        with torch.no_grad():
+            detection_outputs = self.detector.detect_que_imgs(que_img)[0]
+            position = detection_outputs['positions'][0]
+            scale_r2q = detection_outputs['scales'][0]
 
-        if pose_init is None:
-            # stage 1: detection
-            with torch.no_grad():
-                detection_outputs = self.detector.detect_que_imgs(que_img)[0]
-                position = detection_outputs['positions'][0]
-                scale_r2q = detection_outputs['scales'][0]
+        # crop the image according to the detected scale and the detected position
+        que_img_, _ = transformation_crop(que_img, position, 1/scale_r2q, 0, self.cfg['ref_resolution'])  # h,w,3
+        inter_results['det_position'] = position
+        inter_results['det_scale_r2q'] = scale_r2q
+        inter_results['det_que_img'] = que_img_
 
-            # crop the image according to the detected scale and the detected position
-            que_img_, _ = transformation_crop(que_img, position, 1/scale_r2q, 0, self.cfg['ref_resolution'])  # h,w,3
-            inter_results['det_position'] = position
-            inter_results['det_scale_r2q'] = scale_r2q
-            inter_results['det_que_img'] = que_img_
+        # stage 2: viewpoint selection
+        with torch.no_grad():
+            selection_results = self.selector.select_que_imgs(que_img_[None])
 
-            # stage 2: viewpoint selection
-            with torch.no_grad():
-                selection_results = self.selector.select_que_imgs(que_img_[None])
+        ref_idx = selection_results['ref_idx'][0]
+        angle_r2q = selection_results['angles'][0]
+        scores = selection_results['scores'][0]
 
-            ref_idx = selection_results['ref_idx'][0]
-            angle_r2q = selection_results['angles'][0]
-            scores = selection_results['scores'][0]
+        inter_results['sel_angle_r2q'] = angle_r2q
+        inter_results['sel_scores'] = scores
+        inter_results['sel_ref_idx'] = ref_idx
 
-            inter_results['sel_angle_r2q'] = angle_r2q
-            inter_results['sel_scores'] = scores
-            inter_results['sel_ref_idx'] = ref_idx
+        # stage 3: solve for pose from detection/selected viewpoint/in-plane rotation
+        ref_pose = self.ref_info['poses'][ref_idx]
+        ref_K = self.ref_info['Ks'][ref_idx]
+        pose_pr = estimate_pose_from_similarity_transform_compose(
+            position, scale_r2q, angle_r2q, ref_pose, ref_K, que_K, self.ref_info['center'])
 
-            # stage 3: solve for pose from detection/selected viewpoint/in-plane rotation
-            ref_pose = self.ref_info['poses'][ref_idx]
-            ref_K = self.ref_info['Ks'][ref_idx]
-            pose_pr = estimate_pose_from_similarity_transform_compose(
-                position, scale_r2q, angle_r2q, ref_pose, ref_K, que_K, self.ref_info['center'])
-        else:
-            pose_pr = pose_init
 
         # stage 4: refine pose
         if self.refiner is not None:
@@ -338,7 +322,7 @@ class Gen6DMulEstimator(Gen6DEstimator):
             if self.refiner is not None:
                 refine_poses = [pose_pr]
                 for k in range(self.cfg['refine_iter']):
-                    pose_pr = self.refiner.refine_que_imgs(que_img, que_K, pose_pr, size=128, ref_num=6, ref_even=True)
+                    pose_pr = self.refiner.refine_que_imgs(que_img, que_K, pose_pr, size=128, ref_num=64, ref_even=True)
                     refine_poses.append(pose_pr)
                 inter_result['refine_poses'] = refine_poses
             poses.append(pose_pr)
